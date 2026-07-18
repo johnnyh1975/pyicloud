@@ -2,12 +2,15 @@
 
 import logging
 import os
+import socket
 from json import JSONDecodeError, dump, load
 from os import path
 from re import match
 from typing import TYPE_CHECKING, Any, NoReturn, Optional, Union, cast
 
 import requests
+import urllib3.util.connection
+from requests.adapters import HTTPAdapter
 from requests.models import Response
 
 from pyicloud.const import (
@@ -20,6 +23,7 @@ from pyicloud.const import (
     HEADER_DATA,
     AppleAuthError,
 )
+
 from pyicloud.cookie_jar import PyiCloudCookieJar
 from pyicloud.exceptions import (
     PyiCloud2FARequiredException,
@@ -31,6 +35,52 @@ from pyicloud.exceptions import (
 
 if TYPE_CHECKING:
     from pyicloud.base import PyiCloudService
+
+# Apple's authentication endpoint. Kept as a module-level constant (rather
+# than reading service._idmsa_endpoint) because it does not vary between
+# global and China-mainland accounts -- see
+# test_china_mainland_uses_global_idmsa_and_cn_icloud_endpoints in
+# tests/test_base.py, which asserts idmsa stays https://idmsa.apple.com
+# for both account types.
+APPLE_AUTH_ENDPOINT = "https://idmsa.apple.com"
+
+
+class AppleAuthIPv4Adapter(HTTPAdapter):
+    """Forces IPv4-only DNS resolution for requests sent through this adapter.
+
+    Apple's authentication endpoint (idmsa.apple.com) has been observed in
+    production to respond unreliably over IPv6: requests are accepted at
+    the TCP level but the authentication response never arrives, causing
+    hangs rather than a clean connection error. This was independently
+    diagnosed and fixed in iCloud3 (a separate Home Assistant iCloud
+    integration) in v3.4 (April 2026), after months of user reports on
+    IPv6-preferring networks; see the "IPv6 vs IPv4" entry in that
+    project's release notes for the original write-up.
+
+    The override is scoped to this adapter via session.mount() on the
+    idmsa host only, so other iCloud services (calendar, drive, photos,
+    etc.) continue to resolve via whatever the OS prefers (IPv4 or IPv6),
+    unaffected.
+
+    Note: ``urllib3.util.connection.allowed_gai_family`` is a module-level
+    global, so this override is not safe against concurrent requests to
+    idmsa.apple.com from multiple threads sharing the same process. This
+    mirrors a known limitation of the equivalent iCloud3 fix; a fully
+    thread-safe version would need to resolve and connect to a specific
+    IPv4 address directly rather than toggling global resolver state.
+    """
+
+    def send(self, request, **kwargs):  # type: ignore[override]
+        original_allowed_gai_family = urllib3.util.connection.allowed_gai_family
+
+        def _ipv4_only() -> socket.AddressFamily:
+            return socket.AF_INET
+
+        urllib3.util.connection.allowed_gai_family = _ipv4_only
+        try:
+            return super().send(request, **kwargs)
+        finally:
+            urllib3.util.connection.allowed_gai_family = original_allowed_gai_family
 
 
 NON_PERSISTED_SESSION_KEYS = frozenset(
@@ -81,6 +131,13 @@ class PyiCloudSession(requests.Session):
 
         if headers:
             self.headers.update(headers)
+
+        # Scoped to the auth host only -- see AppleAuthIPv4Adapter docstring.
+        # requests matches session mounts by longest-prefix-first, so this
+        # takes precedence over the default "https://" adapter for this
+        # host only; all other hosts (icloud.com, setup.icloud.com, etc.)
+        # are unaffected.
+        self.mount(APPLE_AUTH_ENDPOINT, AppleAuthIPv4Adapter())
 
         self._load_session_data()
 
